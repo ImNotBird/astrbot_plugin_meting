@@ -27,7 +27,7 @@ MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_SESSION_AGE = 3600
 
 
-@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.2")
+@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.3")
 class MetingPlugin(Star):
     """MetingAPI 点歌插件
 
@@ -194,14 +194,13 @@ class MetingPlugin(Star):
         yield event.plain_result("已切换音源为酷我")
 
     @filter.command("点歌")
-    async def search_song(self, event: AstrMessageEvent, keyword: str = ""):
+    async def search_song(self, event: AstrMessageEvent):
         """搜索歌曲，使用当前会话的音源
 
         Args:
             event: 消息事件
-            keyword: 搜索关键词
         """
-        keyword = keyword.strip()
+        keyword = event.get_message_str().replace("点歌", "").strip()
         if not keyword:
             yield event.plain_result("请输入要搜索的歌曲名称，例如：点歌一期一会")
             return
@@ -255,18 +254,21 @@ class MetingPlugin(Star):
             yield event.plain_result("搜索失败，请稍后重试")
 
     @filter.regex(r"^点歌(\d+)$")
-    async def play_song_by_number(self, event: AstrMessageEvent, number: str = ""):
+    async def play_song_by_number(self, event: AstrMessageEvent):
         """播放指定序号的歌曲，以语音形式发送
 
         Args:
             event: 消息事件
-            number: 歌曲序号
         """
-        if not number:
+        import re
+
+        message_str = event.get_message_str().strip()
+        match = re.match(r"^点歌(\d+)$", message_str)
+        if not match:
             return
 
         try:
-            index = int(number)
+            index = int(match.group(1))
         except ValueError:
             return
         session_id = event.unified_msg_origin
