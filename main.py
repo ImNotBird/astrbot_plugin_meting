@@ -1,7 +1,11 @@
 import asyncio
+import ipaddress
 import os
+import re
 import shutil
+import socket
 import tempfile
+import time
 import uuid
 from urllib.parse import urlparse
 
@@ -25,9 +29,20 @@ CHUNK_SIZE = 8192
 SEND_INTERVAL = 1
 MAX_FILE_SIZE = 50 * 1024 * 1024
 MAX_SESSION_AGE = 3600
+AUDIO_CONTENT_TYPES = {
+    "audio/mpeg",
+    "audio/mp3",
+    "audio/wav",
+    "audio/x-wav",
+    "audio/ogg",
+    "audio/x-m4a",
+    "audio/mp4",
+    "audio/x-matroska",
+}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".m4a", ".flac", ".aac", ".wma"}
 
 
-@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.5")
+@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.6")
 class MetingPlugin(Star):
     """MetingAPI 点歌插件
 
@@ -37,20 +52,98 @@ class MetingPlugin(Star):
     def __init__(self, context: Context, config=None):
         super().__init__(context)
         self.config = config
-        self.session_sources = {}
-        self.last_search_results = {}
-        self.session_timestamps = {}
+        self._sessions = {}
         self._http_session = None
         self._ffmpeg_path = self._find_ffmpeg()
         self._cleanup_task = None
         self._download_semaphore = asyncio.Semaphore(3)
+        self._initialized = False
 
     async def initialize(self):
         """插件初始化"""
+        if self._initialized:
+            logger.warning("插件已经初始化，跳过重复初始化")
+            return
+
         logger.info("MetingAPI 点歌插件已初始化")
         self._http_session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
-
         self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
+        self._initialized = True
+
+    def _get_config(self, key: str, default=None, validator=None):
+        """获取配置值，支持类型和范围校验
+
+        Args:
+            key: 配置键
+            default: 默认值
+            validator: 校验函数，接受配置值，返回校验是否通过
+
+        Returns:
+            配置值或默认值
+        """
+        if not self.config:
+            return default
+
+        value = self.config.get(key, default)
+        if validator is not None and not validator(value):
+            return default
+
+        return value
+
+    def get_api_url(self) -> str:
+        """获取 API 地址
+
+        Returns:
+            str: API 地址，如果未配置则返回空字符串
+        """
+        return self._get_config("api_url", "", lambda x: isinstance(x, str) and x)
+
+    def get_default_source(self) -> str:
+        """获取默认音源
+
+        Returns:
+            str: 默认音源，默认为 netease
+        """
+        return self._get_config(
+            "default_source", "netease", lambda x: x in SOURCE_DISPLAY
+        )
+
+    def get_search_result_count(self) -> int:
+        """获取搜索结果显示数量
+
+        Returns:
+            int: 搜索结果显示数量，范围 5-30，默认 10
+        """
+        return self._get_config(
+            "search_result_count", 10, lambda x: isinstance(x, int) and 5 <= x <= 30
+        )
+
+    def _get_session(self, session_id: str) -> dict:
+        """获取会话状态
+
+        Args:
+            session_id: 会话 ID
+
+        Returns:
+            dict: 会话状态字典
+        """
+        if session_id not in self._sessions:
+            self._sessions[session_id] = {
+                "source": self.get_default_source(),
+                "results": [],
+                "timestamp": time.time(),
+            }
+        return self._sessions[session_id]
+
+    def _update_session_timestamp(self, session_id: str):
+        """更新会话时间戳
+
+        Args:
+            session_id: 会话 ID
+        """
+        session = self._get_session(session_id)
+        session["timestamp"] = time.time()
+        self._cleanup_old_sessions()
 
     def _find_ffmpeg(self) -> str:
         """查找 FFmpeg 路径
@@ -65,60 +158,38 @@ class MetingPlugin(Star):
         logger.warning("未找到 FFmpeg，请确保已安装 FFmpeg")
         return ""
 
-    def get_api_url(self) -> str:
-        """获取 API 地址
-
-        Returns:
-            str: API 地址，如果未配置则返回空字符串
-        """
-        if self.config and self.config.get("api_url"):
-            return self.config["api_url"]
-        return ""
-
-    def get_default_source(self) -> str:
-        """获取默认音源
-
-        Returns:
-            str: 默认音源，默认为 netease
-        """
-        if self.config and self.config.get("default_source"):
-            return self.config["default_source"]
-        return "netease"
-
-    def get_search_result_count(self) -> int:
-        """获取搜索结果显示数量
-
-        Returns:
-            int: 搜索结果显示数量，范围 5-30，默认 10
-        """
-        if self.config and self.config.get("search_result_count"):
-            count = self.config["search_result_count"]
-            if isinstance(count, int) and 5 <= count <= 30:
-                return count
-        return 10
-
-    def get_session_source(self, session_id: str) -> str:
-        """获取会话音源
+    def _is_private_ip(self, ip_str: str) -> bool:
+        """判断 IP 是否为私网地址
 
         Args:
-            session_id: 会话 ID
+            ip_str: IP 地址字符串
 
         Returns:
-            str: 会话音源，如果未设置则返回默认音源
+            bool: 是否为私网地址
         """
-        return self.session_sources.get(session_id, self.get_default_source())
+        try:
+            ip = ipaddress.ip_address(ip_str)
+            return ip.is_private or ip.is_loopback or ip.is_link_local
+        except ValueError:
+            return False
 
-    def set_session_source(self, session_id: str, source: str):
-        """设置会话音源
+    def _resolve_hostname(self, hostname: str) -> list:
+        """解析主机名为 IP 地址列表
 
         Args:
-            session_id: 会话 ID
-            source: 音源
+            hostname: 主机名
+
+        Returns:
+            list: IP 地址列表
         """
-        self.session_sources[session_id] = source
+        try:
+            addrinfo = socket.getaddrinfo(hostname, None)
+            return [addr[4][0] for addr in addrinfo]
+        except socket.gaierror:
+            return []
 
     def _validate_url(self, url: str) -> bool:
-        """验证 URL 是否安全
+        """验证 URL 是否安全，防止 SSRF 攻击
 
         Args:
             url: 要验证的 URL
@@ -130,49 +201,44 @@ class MetingPlugin(Star):
             parsed = urlparse(url)
             if parsed.scheme not in ("http", "https"):
                 return False
+
             hostname = parsed.hostname or ""
-            if hostname in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+            if not hostname:
                 return False
 
-            parts = hostname.split(".")
-            if len(parts) == 4:
-                try:
-                    first_octet = int(parts[0])
-                    second_octet = int(parts[1])
+            if hostname in ("localhost", "0.0.0.0"):
+                return False
 
-                    if first_octet == 10:
+            ip_match = re.match(r"^(\d+\.){3}\d+$", hostname)
+            if ip_match:
+                if self._is_private_ip(hostname):
+                    return False
+            else:
+                ips = self._resolve_hostname(hostname)
+                for ip in ips:
+                    if self._is_private_ip(ip):
                         return False
-                    if first_octet == 172 and 16 <= second_octet <= 31:
-                        return False
-                    if first_octet == 192 and second_octet == 168:
-                        return False
-                    if first_octet == 169 and second_octet == 254:
-                        return False
-                except ValueError:
-                    pass
 
             return True
-        except Exception:
+        except Exception as e:
+            logger.error(f"URL 验证失败: {e}")
             return False
 
     def _cleanup_old_sessions(self):
         """清理过期的会话状态"""
-        import time
-
         current_time = time.time()
         expired_sessions = [
             sid
-            for sid, timestamp in self.session_timestamps.items()
-            if current_time - timestamp > MAX_SESSION_AGE
+            for sid, session in self._sessions.items()
+            if current_time - session.get("timestamp", 0) > MAX_SESSION_AGE
         ]
         for sid in expired_sessions:
-            self.session_sources.pop(sid, None)
-            self.last_search_results.pop(sid, None)
-            self.session_timestamps.pop(sid, None)
+            self._sessions.pop(sid, None)
+        if expired_sessions:
+            logger.debug(f"清理了 {len(expired_sessions)} 个过期会话")
 
     async def _periodic_cleanup(self):
         """定期清理过期的会话状态"""
-
         while True:
             try:
                 await asyncio.sleep(3600)
@@ -183,47 +249,55 @@ class MetingPlugin(Star):
             except Exception as e:
                 logger.error(f"定期清理时发生错误: {e}")
 
-    def _update_session_timestamp(self, session_id: str):
-        """更新会话时间戳
+    def _get_session_source(self, session_id: str) -> str:
+        """获取会话音源
 
         Args:
             session_id: 会话 ID
-        """
-        import time
 
-        self.session_timestamps[session_id] = time.time()
-        self._cleanup_old_sessions()
+        Returns:
+            str: 会话音源，如果未设置则返回默认音源
+        """
+        session = self._get_session(session_id)
+        return session.get("source", self.get_default_source())
+
+    def _set_session_source(self, session_id: str, source: str):
+        """设置会话音源
+
+        Args:
+            session_id: 会话 ID
+            source: 音源
+        """
+        session = self._get_session(session_id)
+        session["source"] = source
+        self._update_session_timestamp(session_id)
 
     @filter.command("切换QQ音乐")
     async def switch_tencent(self, event: AstrMessageEvent):
         """切换当前会话的音源为QQ音乐"""
         session_id = event.unified_msg_origin
-        self.set_session_source(session_id, "tencent")
-        self._update_session_timestamp(session_id)
+        self._set_session_source(session_id, "tencent")
         yield event.plain_result("已切换音源为QQ音乐")
 
     @filter.command("切换网易云")
     async def switch_netease(self, event: AstrMessageEvent):
         """切换当前会话的音源为网易云"""
         session_id = event.unified_msg_origin
-        self.set_session_source(session_id, "netease")
-        self._update_session_timestamp(session_id)
+        self._set_session_source(session_id, "netease")
         yield event.plain_result("已切换音源为网易云")
 
     @filter.command("切换酷狗")
     async def switch_kugou(self, event: AstrMessageEvent):
         """切换当前会话的音源为酷狗"""
         session_id = event.unified_msg_origin
-        self.set_session_source(session_id, "kugou")
-        self._update_session_timestamp(session_id)
+        self._set_session_source(session_id, "kugou")
         yield event.plain_result("已切换音源为酷狗")
 
     @filter.command("切换酷我")
     async def switch_kuwo(self, event: AstrMessageEvent):
         """切换当前会话的音源为酷我"""
         session_id = event.unified_msg_origin
-        self.set_session_source(session_id, "kuwo")
-        self._update_session_timestamp(session_id)
+        self._set_session_source(session_id, "kuwo")
         yield event.plain_result("已切换音源为酷我")
 
     @filter.command("点歌")
@@ -234,6 +308,10 @@ class MetingPlugin(Star):
             event: 消息事件
         """
         message_str = event.get_message_str().strip()
+
+        if re.match(r"^点歌\d+$", message_str):
+            return
+
         if message_str.startswith("点歌"):
             keyword = message_str[2:].strip()
         else:
@@ -248,7 +326,7 @@ class MetingPlugin(Star):
             return
 
         session_id = event.unified_msg_origin
-        source = self.get_session_source(session_id)
+        source = self._get_session_source(session_id)
 
         if not self._http_session:
             logger.error("HTTP session 未初始化")
@@ -276,7 +354,8 @@ class MetingPlugin(Star):
 
             result_count = self.get_search_result_count()
             results = data[:result_count]
-            self.last_search_results[session_id] = results
+            session = self._get_session(session_id)
+            session["results"] = results
             self._update_session_timestamp(session_id)
 
             message = f"搜索结果（音源: {SOURCE_DISPLAY.get(source, source)}）:\n"
@@ -308,15 +387,13 @@ class MetingPlugin(Star):
         except (ValueError, IndexError):
             return
         session_id = event.unified_msg_origin
+        session = self._get_session(session_id)
 
-        if (
-            session_id not in self.last_search_results
-            or not self.last_search_results[session_id]
-        ):
+        if not session.get("results"):
             yield event.plain_result('请先使用"点歌"命令搜索歌曲')
             return
 
-        results = self.last_search_results[session_id]
+        results = session["results"]
         if index < 1 or index > len(results):
             yield event.plain_result(
                 f"序号超出范围，请输入 1-{len(results)} 之间的序号"
@@ -344,6 +421,9 @@ class MetingPlugin(Star):
             async for result in self._split_and_send_audio(event, temp_file):
                 yield result
 
+        except asyncio.CancelledError:
+            logger.info("播放任务被取消")
+            yield event.plain_result("播放已取消")
         except Exception as e:
             error_msg = str(e)
             if "下载失败" in error_msg:
@@ -376,7 +456,7 @@ class MetingPlugin(Star):
         download_success = False
         try:
             async with self._download_semaphore:
-                async with self._http_session.get(url) as resp:
+                async with self._http_session.get(url, allow_redirects=False) as resp:
                     if resp.status not in (200, 302, 301, 307, 308):
                         logger.error(f"下载歌曲失败，状态码: {resp.status}")
                         raise Exception(f"下载失败，状态码: {resp.status}")
@@ -393,14 +473,27 @@ class MetingPlugin(Star):
                             raise Exception("下载失败，重定向地址不安全")
 
                         logger.info(f"跟随重定向: {redirect_url}")
-                        actual_resp = await self._http_session.get(redirect_url)
-                        if actual_resp.status != 200:
-                            logger.error(f"下载歌曲失败，状态码: {actual_resp.status}")
-                            raise Exception(f"下载失败，状态码: {actual_resp.status}")
+                        async with self._http_session.get(
+                            redirect_url
+                        ) as redirect_resp:
+                            if redirect_resp.status != 200:
+                                logger.error(
+                                    f"下载歌曲失败，状态码: {redirect_resp.status}"
+                                )
+                                raise Exception(
+                                    f"下载失败，状态码: {redirect_resp.status}"
+                                )
+                            actual_resp = redirect_resp
 
                     content_type = actual_resp.headers.get("Content-Type", "")
                     if not self._is_audio_content(content_type):
                         logger.warning(f"返回的 Content-Type: {content_type}")
+                        raise Exception("下载失败，文件格式不支持")
+
+                    url_path = urlparse(url).path
+                    file_ext = os.path.splitext(url_path)[1].lower()
+                    if file_ext and file_ext not in AUDIO_EXTENSIONS:
+                        logger.warning(f"URL 文件扩展名: {file_ext}")
                         raise Exception("下载失败，文件格式不支持")
 
                     total_size = 0
@@ -420,6 +513,9 @@ class MetingPlugin(Star):
                     download_success = True
                     return temp_file
 
+        except asyncio.CancelledError:
+            logger.info("下载任务被取消")
+            raise
         except Exception as e:
             logger.error(f"下载歌曲时发生错误: {e}")
             raise
@@ -441,11 +537,8 @@ class MetingPlugin(Star):
         """
         if not content_type:
             return False
-        content_type_lower = content_type.lower()
-        return "audio" in content_type_lower or content_type_lower in (
-            "application/octet-stream",
-            "application/x-mpegurl",
-        )
+        content_type_lower = content_type.lower().split(";")[0].strip()
+        return content_type_lower in AUDIO_CONTENT_TYPES
 
     def _split_audio_segments(self, audio, segment_ms: int):
         """分割音频为多个片段
@@ -465,7 +558,7 @@ class MetingPlugin(Star):
             segments.append(segment)
         return segments
 
-    async def _export_segment(self, segment, segment_file: str) -> bool:
+    def _export_segment(self, segment, segment_file: str) -> bool:
         """导出音频片段到文件
 
         Args:
@@ -497,6 +590,7 @@ class MetingPlugin(Star):
         try:
             from pydub import AudioSegment
 
+            original_converter = AudioSegment.converter
             AudioSegment.converter = self._ffmpeg_path
             logger.info(f"FFmpeg 路径已设置为: {self._ffmpeg_path}")
         except ImportError as e:
@@ -521,7 +615,7 @@ class MetingPlugin(Star):
                     f"{base_name}_segment_{idx}_{uuid.uuid4()}.wav",
                 )
 
-                if not await self._export_segment(segment, segment_file):
+                if not self._export_segment(segment, segment_file):
                     continue
 
                 try:
@@ -539,12 +633,21 @@ class MetingPlugin(Star):
             if success_count > 0:
                 yield event.plain_result("歌曲播放完成")
 
+        except asyncio.CancelledError:
+            logger.info("音频处理任务被取消")
+            yield event.plain_result("音频处理已取消")
         except Exception as e:
             logger.error(f"分割音频时发生错误: {e}")
             yield event.plain_result("音频处理失败，请稍后重试")
         finally:
             if os.path.exists(temp_file):
                 os.remove(temp_file)
+            try:
+                from pydub import AudioSegment
+
+                AudioSegment.converter = original_converter
+            except Exception:
+                pass
 
     async def terminate(self):
         """插件终止时清理资源"""
