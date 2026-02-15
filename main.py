@@ -181,9 +181,10 @@ class MetingPlugin(Star):
         Returns:
             int: 最大文件大小（字节），默认 50MB
         """
-        return self._get_config(
-            "max_file_size", 50 * 1024 * 1024, lambda x: isinstance(x, int) and x > 0
+        mb = self._get_config(
+            "max_file_size", 50, lambda x: isinstance(x, int) and 10 <= x <= 200
         )
+        return mb * 1024 * 1024
 
     def _get_session(self, session_id: str) -> dict:
         """获取会话状态
