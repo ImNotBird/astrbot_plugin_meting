@@ -1,5 +1,23 @@
 # 更新日志
 
+## 1.0.9 (2025-02-15)
+
+### 修复
+- 清理未使用的导入/常量/异常类（APIResponseError）
+- 修复类型标注与真实返回不一致问题（_download_song返回str | None）
+- 修复重定向Location处理，使用urljoin处理相对路径
+- 修复_sessions并发访问问题，添加锁保护
+- 修复全局音频锁导致的串行播放问题，改为按session粒度锁
+- 修复_split_and_send_audio早退时temp_file未清理问题
+- 修复terminate()未清空状态问题
+
+### 改进
+- 改进FFmpeg检测逻辑，显式设置AudioSegment.converter
+- 改进application/octet-stream处理，添加文件头魔数检测
+- 添加临时文件定期清理机制
+- 拆分_download_song函数逻辑，降低复杂度
+- 改进代码可读性和可维护性
+
 ## 1.0.8 (2025-02-15)
 
 ### 修复
