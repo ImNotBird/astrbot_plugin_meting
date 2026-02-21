@@ -333,7 +333,8 @@ class MetingPlugin(Star):
         Returns:
             SessionData: 会话状态对象
         """
-        assert self._sessions_lock is not None
+        if self._sessions_lock is None:
+            raise MetingPluginError("插件未正确初始化：_sessions_lock 为空")
         async with self._sessions_lock:
             if session_id not in self._sessions:
                 self._sessions[session_id] = SessionData(self.get_default_source())
@@ -345,7 +346,8 @@ class MetingPlugin(Star):
         Args:
             session_id: 会话 ID
         """
-        assert self._sessions_lock is not None
+        if self._sessions_lock is None:
+            raise MetingPluginError("插件未正确初始化：_sessions_lock 为空")
         async with self._sessions_lock:
             if session_id in self._sessions:
                 self._sessions[session_id].update_timestamp()
@@ -360,7 +362,8 @@ class MetingPlugin(Star):
         Returns:
             asyncio.Lock: 音频处理锁
         """
-        assert self._audio_locks_lock is not None
+        if self._audio_locks_lock is None:
+            raise MetingPluginError("插件未正确初始化：_audio_locks_lock 为空")
         async with self._audio_locks_lock:
             if session_id not in self._session_audio_locks:
                 self._session_audio_locks[session_id] = asyncio.Lock()
@@ -690,7 +693,9 @@ class MetingPlugin(Star):
                     api_url, source, "search", keyword
                 )
                 logger.info(f"[搜歌] 自定义API URL: {api_endpoint}")
-                assert self._http_session is not None
+                if self._http_session is None:
+                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
+                    return
                 async with self._http_session.get(api_endpoint) as resp:
                     if resp.status != 200:
                         response_text = await resp.text()
@@ -711,7 +716,9 @@ class MetingPlugin(Star):
                     "keyword": keyword,
                 }
                 logger.info(f"[搜歌] PHP API URL: {api_url}, 参数: {params}")
-                assert self._http_session is not None
+                if self._http_session is None:
+                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
+                    return
                 async with self._http_session.get(api_url, params=params) as resp:
                     if resp.status != 200:
                         response_text = await resp.text()
@@ -727,7 +734,9 @@ class MetingPlugin(Star):
                 params = {"server": source, "type": "search", "id": keyword}
                 api_endpoint = f"{api_url}/api"
                 logger.info(f"[搜歌] Node API URL: {api_endpoint}, 参数: {params}")
-                assert self._http_session is not None
+                if self._http_session is None:
+                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
+                    return
                 async with self._http_session.get(api_endpoint, params=params) as resp:
                     if resp.status != 200:
                         response_text = await resp.text()
@@ -895,6 +904,8 @@ class MetingPlugin(Star):
                     raise DownloadError(f"网络错误: {e}") from e
                 await asyncio.sleep(1)
             except (DownloadError, UnsafeURLError, AudioFormatError):
+                raise
+            except asyncio.CancelledError:
                 raise
             except Exception as e:
                 logger.error(f"下载歌曲时发生错误: {e}", exc_info=True)
