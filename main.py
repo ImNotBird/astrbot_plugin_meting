@@ -6,6 +6,7 @@ import shutil
 import tempfile
 import time
 import uuid
+from typing import Any
 from urllib.parse import urljoin, urlparse
 
 import aiohttp
@@ -140,7 +141,7 @@ def _check_audio_magic(data: bytes) -> bool:
     return _detect_audio_format(data) is not None
 
 
-def _get_extension_from_format(audio_format: str) -> str:
+def _get_extension_from_format(audio_format: str | None) -> str:
     """根据音频格式获取文件扩展名
 
     Args:
@@ -156,6 +157,8 @@ def _get_extension_from_format(audio_format: str) -> str:
         "flac": ".flac",
         "mp4": ".m4a",
     }
+    if audio_format is None:
+        return ".mp3"
     return mapping.get(audio_format, ".mp3")
 
 
@@ -170,15 +173,15 @@ class MetingPlugin(Star):
         super().__init__(context)
         self.config = config
         self._sessions: dict[str, SessionData] = {}
-        self._sessions_lock = None
-        self._http_session = None
+        self._sessions_lock: asyncio.Lock = None  # type: ignore
+        self._http_session: aiohttp.ClientSession = None  # type: ignore
         self._ffmpeg_path = self._find_ffmpeg()
         self._cleanup_task = None
-        self._download_semaphore = None
+        self._download_semaphore: asyncio.Semaphore = None  # type: ignore
         self._initialized = False
-        self._init_lock = None
+        self._init_lock: asyncio.Lock = None  # type: ignore
         self._session_audio_locks = {}
-        self._audio_locks_lock = None
+        self._audio_locks_lock: asyncio.Lock = None  # type: ignore
 
     async def _ensure_initialized(self):
         """确保插件已初始化（惰性初始化）"""
@@ -207,7 +210,7 @@ class MetingPlugin(Star):
         """插件初始化（框架调用）"""
         await self._ensure_initialized()
 
-    def _get_config(self, key: str, default=None, validator=None):
+    def _get_config(self, key: str, default: Any = None, validator: Any = None) -> Any:
         """获取配置值，支持类型和范围校验
 
         Args:
