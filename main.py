@@ -6,15 +6,18 @@ import shutil
 import tempfile
 import time
 import uuid
-from typing import Any, Callable, Optional, TypeVar
-from urllib.parse import urljoin, urlparse
-
 import aiohttp
-
+from typing import Any, Callable, Optional, TypeVar
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, parse_qs
+from packaging.version import parse as parse_version
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Record
+from astrbot.api.message_components import Json, Record
 from astrbot.api.star import Context, Star, register
+from astrbot.core.config.default import VERSION
+from astrbot.core.pipeline.respond import stage
+from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 SOURCE_DISPLAY = {
     "tencent": "QQ音乐",
@@ -165,7 +168,7 @@ def _get_extension_from_format(audio_format: str | None) -> str:
 T = TypeVar("T")
 
 
-@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.0")
+@register("astrbot_plugin_meting", "chuyegzs", "基于 MetingAPI 的点歌插件", "1.0.4")
 class MetingPlugin(Star):
     """MetingAPI 点歌插件
 
@@ -204,10 +207,40 @@ class MetingPlugin(Star):
             self._audio_locks_lock = asyncio.Lock()
             self._download_semaphore = asyncio.Semaphore(3)
 
-            self._http_session = aiohttp.ClientSession(timeout=REQUEST_TIMEOUT)
+            if not self._http_session:
+                self._http_session = aiohttp.ClientSession(
+                    timeout=REQUEST_TIMEOUT,
+                    # 标识请求来源
+                    headers={
+                        "Referer": "https://astrbot.app/",
+                        "User-Agent": f"AstrBot/{VERSION}",
+                        "UAK": "AstrBot/plugin_meting",
+                    },
+                )
+
             self._cleanup_task = asyncio.create_task(self._periodic_cleanup())
             self._initialized = True
             logger.info("MetingAPI 点歌插件初始化完成")
+
+            if self.use_music_card():
+                try:
+                    # 进行版本校验，检查是否支持 JSON 消息组件
+                    is_unsupported = False
+                    if parse_version(VERSION) < parse_version("4.17.6"):
+                        # 版本号不得小于 4.17.6
+                        is_unsupported = True
+                    else:
+                        with open(stage.__file__, "r", encoding="utf-8") as f:
+                            content = f.read()
+                            # 不存在"Comp.Json"字样说明可能没有 JSON 消息组件支持
+                            if "Comp.Json" not in content:
+                                is_unsupported = True
+                    if is_unsupported:
+                        logger.warning(
+                            "检测到当前 AstrBot 版本可能不支持 JSON 消息组件。请更新 AstrBot 版本，否则音乐卡片可能无法发送。"
+                        )
+                except Exception as e:
+                    logger.debug(f"检查 AstrBot兼容性失败: {e}")
 
     async def initialize(self):
         """插件初始化（框架调用）"""
@@ -241,7 +274,8 @@ class MetingPlugin(Star):
         Returns:
             str: API 地址，如果未配置则返回空字符串
         """
-        return self._get_config("api_url", "", lambda x: isinstance(x, str) and x)
+        url = self._get_config("api_url", "", lambda x: isinstance(x, str) and x)
+        return url.replace("http://", "https://") if url else ""
 
     def get_api_type(self) -> int:
         """获取 API 类型
@@ -252,6 +286,25 @@ class MetingPlugin(Star):
         return self._get_config(
             "api_type", 1, lambda x: isinstance(x, int) and x in (1, 2, 3)
         )
+
+    def get_sign_api_url(self) -> str:
+        """音乐卡片签名 API 地址
+
+        Returns:
+            str: 签名 API 地址
+        """
+        url = str(
+            self._get_config("api_sign_url", "https://oiapi.net/api/QQMusicJSONArk/")
+        ).rstrip("/")
+        return url.replace("http://", "https://")
+
+    def use_music_card(self) -> bool:
+        """音乐卡片开关
+
+        Returns:
+            bool: 是否启用音乐卡片
+        """
+        return bool(self._get_config("use_music_card", False))
 
     def _build_api_url_for_custom(
         self, template: str, server: str, req_type: str, id_val: str
@@ -473,7 +526,9 @@ class MetingPlugin(Star):
                 await asyncio.sleep(3600)
                 lock = self._sessions_lock
                 if lock is None:
-                    logger.error("定期清理任务检测到 _sessions_lock 为 None，停止清理循环")
+                    logger.error(
+                        "定期清理任务检测到 _sessions_lock 为 None，停止清理循环"
+                    )
                     break
                 async with lock:
                     await self._cleanup_old_sessions_locked()
@@ -628,6 +683,99 @@ class MetingPlugin(Star):
             yield event.plain_result(f"歌曲地址无效: {reason}")
             return
 
+        # 音乐卡片
+        if self.use_music_card():
+            title = song.get("name") or song.get("title", "未知")
+            artist = song.get("artist") or song.get("author", "未知歌手")
+            cover = song.get("pic", "")
+            source = song.get("source") or await self._get_session_source(session_id)
+
+            if cover:
+                # 设置封面 URL
+                if source == "netease":
+                    # 不知道为什么，Q音接口现在指定封面大小有概率爆炸...
+                    connector = "&" if "?" in cover else "?"
+                    cover = f"{cover}{connector}picsize=320"
+                try:
+                    if self._http_session:
+                        async with self._http_session.get(
+                            cover, allow_redirects=False
+                        ) as c_resp:
+                            if c_resp.status in (301, 302):
+                                cover = c_resp.headers.get("Location", cover)
+                except Exception as e:
+                    logger.warning(f"解析封面跳转失败: {e}")
+
+            song_id = ""
+            try:
+                query = urlparse(song_url).query
+                song_id = parse_qs(query).get("id", [""])[0]
+            except Exception:
+                pass
+
+            # 根据音源设置对应的跳转链接
+            if source == "netease":
+                jump_url = f"https://music.163.com/#/song?id={song_id}"
+                fmt = "163"
+            elif source == "tencent":
+                jump_url = f"https://y.qq.com/n/ryqq/songDetail/{song_id}"
+                fmt = "qq"
+            elif source == "bilibili":
+                jump_url = f"https://www.bilibili.com/audio/{song_id}"
+                fmt = "bilibili"
+            elif source == "kugou":
+                jump_url = f"https://www.kugou.com/song/#{song_id}"
+                fmt = "kugou"
+            elif source == "kuwo":
+                jump_url = f"https://kuwo.cn/play_detail/{song_id}"
+                fmt = "kuwo"
+            else:
+                jump_url = song_url.replace("type=url", "type=song")
+                fmt = "163"
+
+            if not self._http_session:
+                yield event.plain_result("HTTP Session 未初始化")
+                return
+
+            # 强制将所有 URL 转换为 https
+            song_url = song_url.replace("http://", "https://")
+            if cover:
+                cover = cover.replace("http://", "https://")
+            if jump_url:
+                jump_url = jump_url.replace("http://", "https://")
+
+            sign_api = self.get_sign_api_url()
+            params = {
+                "url": song_url,
+                "song": title,
+                "singer": artist,
+                "cover": cover,
+                "jump": jump_url,
+                "format": fmt,
+            }
+            try:
+                async with self._http_session.get(sign_api, params=params) as resp:
+                    if resp.status != 200:
+                        yield event.plain_result(f"签名接口请求失败: {resp.status}")
+                        return
+                    res_json = await resp.json()
+                    if res_json.get("code") == 1:
+                        ark_data = res_json.get("data")
+                        token = ark_data.get("config", {}).get("token", "")
+                        json_card = Json(data=ark_data, config={"token": token})
+                        logger.info("音乐卡片签名成功，发送卡片")
+                        logger.debug(f"卡片数据: {json_card}")
+                        yield event.chain_result([json_card])
+                    else:
+                        yield event.plain_result(
+                            f"签名失败: {res_json.get('message', '未知错误')}"
+                        )
+            except Exception as e:
+                logger.error(f"音乐卡片请求异常: {e}")
+                yield event.plain_result("制作卡片时出错")
+            return
+
+        # 普通语音发送模式
         try:
             temp_file = await self._download_song(song_url, event.get_sender_id())
             if not temp_file:
@@ -792,6 +940,7 @@ class MetingPlugin(Star):
         Returns:
             str | None: 临时文件路径，失败返回 None
         """
+        url = url.replace("http://", "https://")
         http_session = self._http_session
         if not http_session:
             raise DownloadError("HTTP session 未初始化")
