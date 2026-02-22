@@ -6,24 +6,25 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
+from typing import Any, TypeVar
+from urllib.parse import parse_qs, urljoin, urlparse
+
 import aiohttp
-from typing import Any, Callable, Optional, TypeVar
-from pathlib import Path
-from urllib.parse import urljoin, urlparse, parse_qs
 from packaging.version import parse as parse_version
+
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.message_components import Json, Record
 from astrbot.api.star import Context, Star, register
 from astrbot.core.config.default import VERSION
 from astrbot.core.pipeline.respond import stage
-from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 
 SOURCE_DISPLAY = {
     "tencent": "QQ音乐",
-    "netease": "网易云",
-    "kugou": "酷狗",
-    "kuwo": "酷我",
+    "netease": "网易云音乐",
+    "kugou": "酷狗音乐",
+    "kuwo": "酷我音乐",
 }
 
 REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=120)
@@ -179,15 +180,15 @@ class MetingPlugin(Star):
         super().__init__(context)
         self.config = config
         self._sessions: dict[str, SessionData] = {}
-        self._sessions_lock: Optional[asyncio.Lock] = None
-        self._http_session: Optional[aiohttp.ClientSession] = None
+        self._sessions_lock: asyncio.Lock | None = None
+        self._http_session: aiohttp.ClientSession | None = None
         self._ffmpeg_path = self._find_ffmpeg()
         self._cleanup_task = None
-        self._download_semaphore: Optional[asyncio.Semaphore] = None
+        self._download_semaphore: asyncio.Semaphore | None = None
         self._initialized = False
-        self._init_lock: Optional[asyncio.Lock] = None
+        self._init_lock: asyncio.Lock | None = None
         self._session_audio_locks = {}
-        self._audio_locks_lock: Optional[asyncio.Lock] = None
+        self._audio_locks_lock: asyncio.Lock | None = None
 
     async def _ensure_initialized(self):
         """确保插件已初始化（惰性初始化）"""
@@ -230,7 +231,7 @@ class MetingPlugin(Star):
                         # 版本号不得小于 4.17.6
                         is_unsupported = True
                     else:
-                        with open(stage.__file__, "r", encoding="utf-8") as f:
+                        with open(stage.__file__, encoding="utf-8") as f:
                             content = f.read()
                             # 不存在"Comp.Json"字样说明可能没有 JSON 消息组件支持
                             if "Comp.Json" not in content:
@@ -247,7 +248,7 @@ class MetingPlugin(Star):
         await self._ensure_initialized()
 
     def _get_config(
-        self, key: str, default: T, validator: Optional[Callable[[Any], Any]] = None
+        self, key: str, default: T, validator: Callable[[Any], Any] | None = None
     ) -> T:
         """获取配置值，支持类型和范围校验
 
@@ -268,13 +269,28 @@ class MetingPlugin(Star):
 
         return value
 
+    def _get_api_config(self) -> dict:
+        """获取 API 配置字典"""
+        return self._get_config("api_config", {}, lambda x: isinstance(x, dict))
+
     def get_api_url(self) -> str:
         """获取 API 地址
 
         Returns:
             str: API 地址，如果未配置则返回空字符串
         """
-        url = self._get_config("api_url", "", lambda x: isinstance(x, str) and x)
+        api_config = self._get_api_config()
+        api_url = api_config.get("api_url", "https://musictsapi.chuye.us.kg/")
+        if api_url == "custom":
+            # 仅当选择了自定义 API 类型时才使用 custom_api_url 配置项
+            url = api_config.get("custom_api_url", "")
+            if not url:
+                logger.warning(
+                    "API 地址设置为 custom 但未填写 custom_api_url，将回退到默认接口"
+                )
+                url = "https://musictsapi.chuye.us.kg/"
+        else:
+            url = api_url
         return url.replace("http://", "https://") if url else ""
 
     def get_api_type(self) -> int:
@@ -283,9 +299,52 @@ class MetingPlugin(Star):
         Returns:
             int: API 类型，1=Node API, 2=PHP API, 3=自定义参数
         """
-        return self._get_config(
-            "api_type", 1, lambda x: isinstance(x, int) and x in (1, 2, 3)
-        )
+        api_config = self._get_api_config()
+        api_url = api_config.get("api_url", "https://musicapi.chuyel.top/meting/")
+        if api_url == "https://musicapi.chuyel.top/meting/":
+            return 1
+        elif api_url == "https://musictsapi.chuye.us.kg/":
+            return 1
+        elif api_url == "https://musicapi.chuyel.top/":
+            return 1
+        elif api_url == "https://metingapi.nanorocky.top/":
+            return 2
+        elif api_url == "custom":
+            if not api_config.get("custom_api_url", ""):
+                return 1
+
+            # 仅当选择了自定义 API 地址时才使用 api_type 配置项
+            api_type = api_config.get("api_type", 1)
+            api_type = (
+                api_type if isinstance(api_type, int) and api_type in (1, 2, 3) else 1
+            )
+
+            if api_type == 3:
+                template = api_config.get("custom_api_template", "")
+                if not template:
+                    logger.warning(
+                        "API 类型设置为 3 但未填写 custom_api_template，将回退到类型 1"
+                    )
+                    return 1
+            return api_type
+
+        return 1
+
+    def get_custom_api_template(self) -> str:
+        """获取自定义 API 模板
+
+        Returns:
+            str: 自定义 API 模板，如果未配置则返回空字符串
+        """
+        api_config = self._get_api_config()
+        api_url = api_config.get("api_url", "")
+
+        if api_url == "custom":
+            if not api_config.get("custom_api_url", ""):
+                return ""
+            template = api_config.get("custom_api_template", "")
+            return template if isinstance(template, str) else ""
+        return ""
 
     def get_sign_api_url(self) -> str:
         """音乐卡片签名 API 地址
@@ -307,11 +366,12 @@ class MetingPlugin(Star):
         return bool(self._get_config("use_music_card", False))
 
     def _build_api_url_for_custom(
-        self, template: str, server: str, req_type: str, id_val: str
+        self, api_url: str, template: str, server: str, req_type: str, id_val: str
     ) -> str:
         """根据模板构建 API URL（自定义参数类型）
 
         Args:
+            api_url: 基础 API 地址
             template: API 模板
             server: 音源
             req_type: 请求类型
@@ -320,11 +380,18 @@ class MetingPlugin(Star):
         Returns:
             str: 完整的 API URL
         """
-        url = template.replace(":server", server)
-        url = url.replace(":type", req_type)
-        url = url.replace(":id", id_val)
-        url = url.replace(":r", str(int(time.time() * 1000)))
-        return url
+        query = template.replace(":server", server)
+        query = query.replace(":type", req_type)
+        query = query.replace(":id", id_val)
+        query = query.replace(":r", str(int(time.time() * 1000)))
+
+        if query.startswith("/") or query.startswith("?"):
+            return f"{api_url.rstrip('/')}{query}"
+
+        if "?" in api_url:
+            return f"{api_url}&{query}"
+        else:
+            return f"{api_url}?{query}"
 
     def get_default_source(self) -> str:
         """获取默认音源
@@ -606,71 +673,64 @@ class MetingPlugin(Star):
         session = await self._get_session(session_id)
         return session.results
 
-    @filter.command("切换QQ音乐")
-    async def switch_tencent(self, event: AstrMessageEvent):
-        """切换当前会话的音源为QQ音乐"""
-        await self._ensure_initialized()
-        session_id = event.unified_msg_origin
-        await self._set_session_source(session_id, "tencent")
-        yield event.plain_result("已切换音源为QQ音乐")
+    async def _perform_search(self, keyword: str, source: str) -> list | None:
+        """执行搜索并返回结果列表"""
+        api_url = self.get_api_url()
+        api_type = self.get_api_type()
+        custom_api_template = self.get_custom_api_template()
 
-    @filter.command("切换网易云")
-    async def switch_netease(self, event: AstrMessageEvent):
-        """切换当前会话的音源为网易云"""
-        await self._ensure_initialized()
-        session_id = event.unified_msg_origin
-        await self._set_session_source(session_id, "netease")
-        yield event.plain_result("已切换音源为网易云")
+        try:
+            if api_type == 3:
+                api_endpoint = self._build_api_url_for_custom(
+                    api_url, custom_api_template, source, "search", keyword
+                )
+                logger.info(f"[搜歌] 自定义API URL: {api_endpoint}")
+                if self._http_session is None:
+                    return None
+                async with self._http_session.get(api_endpoint) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            elif api_type == 2:
+                params = {
+                    "server": source,
+                    "type": "search",
+                    "id": "0",
+                    "dwrc": "false",
+                    "keyword": keyword,
+                }
+                logger.info(f"[搜歌] PHP API URL: {api_url}, 参数: {params}")
+                if self._http_session is None:
+                    return None
+                async with self._http_session.get(api_url, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
+            else:
+                params = {"server": source, "type": "search", "id": keyword}
+                api_endpoint = f"{api_url}/api"
+                logger.info(f"[搜歌] Node API URL: {api_endpoint}, 参数: {params}")
+                if self._http_session is None:
+                    return None
+                async with self._http_session.get(api_endpoint, params=params) as resp:
+                    if resp.status != 200:
+                        return None
+                    data = await resp.json()
 
-    @filter.command("切换酷狗")
-    async def switch_kugou(self, event: AstrMessageEvent):
-        """切换当前会话的音源为酷狗"""
-        await self._ensure_initialized()
-        session_id = event.unified_msg_origin
-        await self._set_session_source(session_id, "kugou")
-        yield event.plain_result("已切换音源为酷狗")
+            if not isinstance(data, list) or not data:
+                return []
 
-    @filter.command("切换酷我")
-    async def switch_kuwo(self, event: AstrMessageEvent):
-        """切换当前会话的音源为酷我"""
-        await self._ensure_initialized()
-        session_id = event.unified_msg_origin
-        await self._set_session_source(session_id, "kuwo")
-        yield event.plain_result("已切换音源为酷我")
+            result_count = self.get_search_result_count()
+            return data[:result_count]
 
-    @filter.regex(r"^点歌\s+(\d+)$")
-    async def play_song_by_index(self, event: AstrMessageEvent):
-        """播放指定序号的歌曲（点歌 x格式，带空格）
+        except Exception as e:
+            logger.error(f"搜索歌曲时发生错误: {e}", exc_info=True)
+            return None
 
-        Args:
-            event: 消息事件
-        """
-        await self._ensure_initialized()
-
-        message_str = event.get_message_str().strip()
-        session_id = event.unified_msg_origin
-
-        match = re.match(r"^点歌\s+(\d+)$", message_str)
-        if not match:
-            return
-
-        index = int(match.group(1))
-        logger.info(f"[点歌] 播放模式，序号: {index}")
-
-        results = await self._get_session_results(session_id)
-        logger.info(f"[点歌] 会话结果数量: {len(results)}")
-
-        if not results:
-            yield event.plain_result('请先使用"搜歌 歌曲名"搜索歌曲')
-            return
-
-        if index < 1 or index > len(results):
-            yield event.plain_result(
-                f"序号超出范围，请输入 1-{len(results)} 之间的序号"
-            )
-            return
-
-        song = results[index - 1]
+    async def _play_song_logic(
+        self, event: AstrMessageEvent, song: dict, session_id: str
+    ):
+        """播放歌曲的通用逻辑"""
         song_url = song.get("url")
 
         if not song_url:
@@ -685,8 +745,8 @@ class MetingPlugin(Star):
 
         # 音乐卡片
         if self.use_music_card():
-            title = song.get("name") or song.get("title", "未知")
-            artist = song.get("artist") or song.get("author", "未知歌手")
+            title = song.get("name") or song.get("title") or "未知"
+            artist = song.get("artist") or song.get("author") or "未知歌手"
             cover = song.get("pic", "")
             source = song.get("source") or await self._get_session_source(session_id)
 
@@ -803,6 +863,235 @@ class MetingPlugin(Star):
             logger.error(f"播放歌曲时发生错误: {e}", exc_info=True)
             yield event.plain_result("播放失败，请稍后重试")
 
+    @filter.command("切换QQ音乐", alias={"切换腾讯音乐", "切换QQMusic"})
+    async def switch_tencent(self, event: AstrMessageEvent):
+        """切换当前会话的音源为QQ音乐"""
+        await self._ensure_initialized()
+        session_id = event.unified_msg_origin
+        await self._set_session_source(session_id, "tencent")
+        yield event.plain_result("已切换音源为QQ音乐")
+
+    @filter.command(
+        "切换网易云",
+        alias={
+            "切换网易",
+            "切换网易云音乐",
+            "切换网抑云",
+            "切换网抑云音乐",
+            "切换CloudMusic",
+        },
+    )
+    async def switch_netease(self, event: AstrMessageEvent):
+        """切换当前会话的音源为网易云"""
+        await self._ensure_initialized()
+        session_id = event.unified_msg_origin
+        await self._set_session_source(session_id, "netease")
+        yield event.plain_result("已切换音源为网易云")
+
+    @filter.command("切换酷狗", alias={"切换酷狗音乐"})
+    async def switch_kugou(self, event: AstrMessageEvent):
+        """切换当前会话的音源为酷狗"""
+        await self._ensure_initialized()
+        session_id = event.unified_msg_origin
+        await self._set_session_source(session_id, "kugou")
+        yield event.plain_result("已切换音源为酷狗")
+
+    @filter.command("切换酷我", alias={"切换酷我音乐"})
+    async def switch_kuwo(self, event: AstrMessageEvent):
+        """切换当前会话的音源为酷我"""
+        await self._ensure_initialized()
+        session_id = event.unified_msg_origin
+        await self._set_session_source(session_id, "kuwo")
+        yield event.plain_result("已切换音源为酷我")
+
+    @filter.command("网易点歌", alias={"网易云点歌", "网抑云点歌", "网易云音乐点歌"})
+    async def play_netease_first_song(self, event: AstrMessageEvent):
+        """网易云点歌"""
+        await self._ensure_initialized()
+        msg = event.get_message_str().strip()
+        kw = msg
+        for prefix in ["网易云音乐点歌", "网易云点歌", "网抑云点歌", "网易点歌"]:
+            if kw.startswith(prefix):
+                kw = kw[len(prefix) :].strip()
+                break
+        if not kw:
+            yield event.plain_result("请输入要点播的歌曲名称，例如：网易点歌 一期一会")
+            return
+
+        results = await self._perform_search(kw, "netease")
+        if not results:
+            yield event.plain_result(f"未找到歌曲: {kw}")
+            return
+
+        song = results[0]
+        if "source" not in song:
+            song["source"] = "netease"
+
+        async for result in self._play_song_logic(
+            event, song, event.unified_msg_origin
+        ):
+            yield result
+
+    @filter.command("腾讯点歌", alias={"QQ点歌", "QQ音乐点歌", "腾讯音乐点歌"})
+    async def play_tencent_first_song(self, event: AstrMessageEvent):
+        """QQ音乐点歌"""
+        await self._ensure_initialized()
+        msg = event.get_message_str().strip()
+        kw = msg
+        for prefix in ["腾讯音乐点歌", "QQ音乐点歌", "腾讯点歌", "QQ点歌"]:
+            if kw.startswith(prefix):
+                kw = kw[len(prefix) :].strip()
+                break
+        if not kw:
+            yield event.plain_result("请输入要点播的歌曲名称，例如：QQ点歌 一期一会")
+            return
+
+        results = await self._perform_search(kw, "tencent")
+        if not results:
+            yield event.plain_result(f"未找到歌曲: {kw}")
+            return
+
+        song = results[0]
+        if "source" not in song:
+            song["source"] = "tencent"
+
+        async for result in self._play_song_logic(
+            event, song, event.unified_msg_origin
+        ):
+            yield result
+
+    @filter.command("酷狗点歌", alias={"酷狗音乐点歌"})
+    async def play_kugou_first_song(self, event: AstrMessageEvent):
+        """酷狗点歌"""
+        await self._ensure_initialized()
+        msg = event.get_message_str().strip()
+        kw = msg
+        if kw.startswith("酷狗点歌"):
+            kw = kw[4:].strip()
+        if not kw:
+            yield event.plain_result("请输入要点播的歌曲名称，例如：酷狗点歌 一期一会")
+            return
+
+        results = await self._perform_search(kw, "kugou")
+        if not results:
+            yield event.plain_result(f"未找到歌曲: {kw}")
+            return
+
+        song = results[0]
+        if "source" not in song:
+            song["source"] = "kugou"
+
+        async for result in self._play_song_logic(
+            event, song, event.unified_msg_origin
+        ):
+            yield result
+
+    @filter.command("酷我点歌", alias={"酷我音乐点歌"})
+    async def play_kuwo_first_song(self, event: AstrMessageEvent):
+        """酷我点歌"""
+        await self._ensure_initialized()
+        msg = event.get_message_str().strip()
+        kw = msg
+        if kw.startswith("酷我点歌"):
+            kw = kw[4:].strip()
+        if not kw:
+            yield event.plain_result("请输入要点播的歌曲名称，例如：酷我点歌 一期一会")
+            return
+
+        results = await self._perform_search(kw, "kuwo")
+        if not results:
+            yield event.plain_result(f"未找到歌曲: {kw}")
+            return
+
+        song = results[0]
+        if "source" not in song:
+            song["source"] = "kuwo"
+
+        async for result in self._play_song_logic(
+            event, song, event.unified_msg_origin
+        ):
+            yield result
+
+    @filter.command("点歌指令", alias={"点歌帮助", "点歌说明", "点歌指南", "点歌菜单"})
+    async def show_commands(self, event: AstrMessageEvent):
+        # 显示所有可用指令
+        commands = [
+            "🎵 MetingAPI 点歌插件指令列表 🎵",
+            "========================",
+            "【基础指令】",
+            "• 搜歌 <歌名> - 搜索歌曲并显示列表",
+            "• 点歌 <序号> - 播放搜索列表中的指定歌曲",
+            "• 点歌 <歌名> - 直接搜索并播放第一首歌曲",
+            "",
+            "【快捷点歌】(忽略全局音源设置)",
+            "• 网易点歌 <歌名> - 在网易云音乐中搜索并播放",
+            "• QQ点歌 <歌名> - 在QQ音乐中搜索并播放",
+            "• 酷狗点歌 <歌名> - 在酷狗音乐中搜索并播放",
+            "• 酷我点歌 <歌名> - 在酷我音乐中搜索并播放",
+            "",
+            "【音源切换】(影响'搜歌'和'点歌'指令)",
+            "• 切换网易云 - 切换默认音源为网易云音乐",
+            "• 切换QQ音乐 - 切换默认音源为QQ音乐",
+            "• 切换酷狗 - 切换默认音源为酷狗音乐",
+            "• 切换酷我 - 切换默认音源为酷我音乐",
+            "========================",
+        ]
+        yield event.plain_result("\n".join(commands))
+
+    @filter.command("点歌")
+    async def play_song_cmd(self, event: AstrMessageEvent):
+        """点歌指令，支持序号或歌名"""
+        await self._ensure_initialized()
+
+        message_str = event.get_message_str().strip()
+        session_id = event.unified_msg_origin
+
+        if message_str.startswith("点歌"):
+            arg = message_str[2:].strip()
+        else:
+            arg = message_str
+
+        if not arg:
+            yield event.plain_result(
+                "请输入要点播的歌曲序号或名称，例如：点歌 1 或 点歌 一期一会"
+            )
+            return
+
+        if arg.isdigit() and 1 <= int(arg) <= 100:
+            index = int(arg)
+            logger.info(f"[点歌] 播放模式，序号: {index}")
+
+            results = await self._get_session_results(session_id)
+            logger.info(f"[点歌] 会话结果数量: {len(results)}")
+
+            if not results:
+                yield event.plain_result('请先使用"搜歌 歌曲名"搜索歌曲')
+                return
+
+            if index < 1 or index > len(results):
+                yield event.plain_result(
+                    f"序号超出范围，请输入 1-{len(results)} 之间的序号"
+                )
+                return
+
+            song = results[index - 1]
+            async for result in self._play_song_logic(event, song, session_id):
+                yield result
+        else:
+            logger.info(f"[点歌] 搜索并播放模式，歌名: {arg}")
+            source = await self._get_session_source(session_id)
+            results = await self._perform_search(arg, source)
+            if not results:
+                yield event.plain_result(f"未找到歌曲: {arg}")
+                return
+
+            song = results[0]
+            if "source" not in song:
+                song["source"] = source
+
+            async for result in self._play_song_logic(event, song, session_id):
+                yield result
+
     @filter.command("搜歌")
     async def search_song(self, event: AstrMessageEvent):
         """搜索歌曲（搜歌 xxx格式）
@@ -826,109 +1115,27 @@ class MetingPlugin(Star):
 
         logger.info(f"[搜歌] 搜索模式，关键词: {keyword}")
 
-        api_url = self.get_api_url()
-        api_type = self.get_api_type()
+        source = await self._get_session_source(session_id)
+        results = await self._perform_search(keyword, source)
 
-        if not api_url:
-            yield event.plain_result("请先在插件配置中设置 MetingAPI 地址")
+        if results is None:
+            yield event.plain_result("搜索失败，请稍后重试")
             return
 
-        source = await self._get_session_source(session_id)
+        if not results:
+            yield event.plain_result(f"未找到歌曲: {keyword}")
+            return
 
-        try:
-            if api_type == 3:
-                api_endpoint = self._build_api_url_for_custom(
-                    api_url, source, "search", keyword
-                )
-                logger.info(f"[搜歌] 自定义API URL: {api_endpoint}")
-                if self._http_session is None:
-                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
-                    return
-                async with self._http_session.get(api_endpoint) as resp:
-                    if resp.status != 200:
-                        response_text = await resp.text()
-                        logger.error(
-                            f"搜索失败，API 返回状态码: {resp.status}, 响应: {response_text[:500]}"
-                        )
-                        yield event.plain_result(
-                            f"搜索失败，API 返回状态码: {resp.status}"
-                        )
-                        return
-                    data = await resp.json()
-            elif api_type == 2:
-                params = {
-                    "server": source,
-                    "type": "search",
-                    "id": "0",
-                    "dwrc": "false",
-                    "keyword": keyword,
-                }
-                logger.info(f"[搜歌] PHP API URL: {api_url}, 参数: {params}")
-                if self._http_session is None:
-                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
-                    return
-                async with self._http_session.get(api_url, params=params) as resp:
-                    if resp.status != 200:
-                        response_text = await resp.text()
-                        logger.error(
-                            f"搜索失败，API 返回状态码: {resp.status}, 响应: {response_text[:500]}"
-                        )
-                        yield event.plain_result(
-                            f"搜索失败，API 返回状态码: {resp.status}"
-                        )
-                        return
-                    data = await resp.json()
-            else:
-                params = {"server": source, "type": "search", "id": keyword}
-                api_endpoint = f"{api_url}/api"
-                logger.info(f"[搜歌] Node API URL: {api_endpoint}, 参数: {params}")
-                if self._http_session is None:
-                    yield event.plain_result("插件未正确初始化：HTTP Session 为空")
-                    return
-                async with self._http_session.get(api_endpoint, params=params) as resp:
-                    if resp.status != 200:
-                        response_text = await resp.text()
-                        logger.error(
-                            f"搜索失败，API 返回状态码: {resp.status}, 响应: {response_text[:500]}"
-                        )
-                        yield event.plain_result(
-                            f"搜索失败，API 返回状态码: {resp.status}"
-                        )
-                        return
-                    data = await resp.json()
+        await self._set_session_results(session_id, results)
 
-            logger.debug(
-                f"[搜歌] API 返回数据类型: {type(data)}, 数据量: {len(data) if isinstance(data, list) else 'N/A'}"
-            )
+        message = f"搜索结果（音源: {SOURCE_DISPLAY.get(source, source)}）:\n"
+        for idx, song in enumerate(results, 1):
+            name = song.get("name") or song.get("title") or "未知"
+            artist = song.get("artist") or song.get("author") or "未知歌手"
+            message += f"{idx}. {name} - {artist}\n"
 
-            if not isinstance(data, list):
-                logger.error(f"API 返回异常数据类型: {type(data)}, 内容: {data}")
-                yield event.plain_result("API 返回异常，请稍后重试")
-                return
-
-            if not data or len(data) == 0:
-                yield event.plain_result(f"未找到歌曲: {keyword}")
-                return
-
-            result_count = self.get_search_result_count()
-            results = data[:result_count]
-            await self._set_session_results(session_id, results)
-
-            message = f"搜索结果（音源: {SOURCE_DISPLAY.get(source, source)}）:\n"
-            for idx, song in enumerate(results, 1):
-                name = song.get("title", "未知")
-                artist = song.get("author", "未知歌手")
-                message += f"{idx}. {name} - {artist}\n"
-
-            message += '\n发送"点歌 1"播放第一首歌曲'
-            yield event.plain_result(message)
-
-        except aiohttp.ClientError as e:
-            logger.error(f"搜索歌曲时网络错误: {e}", exc_info=True)
-            yield event.plain_result(f"网络错误: {e}")
-        except Exception as e:
-            logger.error(f"搜索歌曲时发生错误: {e}", exc_info=True)
-            yield event.plain_result(f"搜索失败: {e}")
+        message += '\n发送"点歌 1"播放第一首歌曲'
+        yield event.plain_result(message)
 
     async def _download_song(self, url: str, sender_id: str) -> str | None:
         """下载歌曲文件

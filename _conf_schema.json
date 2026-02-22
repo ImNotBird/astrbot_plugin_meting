@@ -1,20 +1,43 @@
 {
-  "api_url": {
-    "description": "MetingAPI 地址",
-    "type": "string",
-    "hint": "不带后面的后缀，例如：https://api.example.com/meting。若API类型选择3，此处填写完整模板，如：https://api.i-meto.com/meting/api?server=:server&type=:type&id=:id&r=:r"
+  "api_config": {
+    "description": "MetingAPI 配置",
+    "type": "object",
+    "hint": "配置 MetingAPI",
+    "items": {
+      "api_url": {
+        "description": "MetingAPI 地址",
+        "type": "string",
+        "hint": "选择 API ，如需自定义请选择 custom",
+        "options": [
+          "https://musicapi.chuyel.top/meting/",
+          "https://metingapi.nanorocky.top/",
+          "custom"
+        ],
+        "default": "https://musicapi.chuyel.top/meting/"
+      },
+      "api_type": {
+        "description": "API 类型",
+        "type": "int",
+        "hint": "（仅在 API 地址为 custom 时生效） 1: Node API （默认）, 2: PHP API, 3: 自定义参数",
+        "default": 1
+      },
+      "custom_api_url": {
+        "description": "自定义 API 地址",
+        "type": "string",
+        "hint": "（仅在 API 地址为 custom 时生效）不带 /api 的后缀，例如： https://api.example.com/meting"
+      },
+      "custom_api_template": {
+        "description": "自定义 API 模板",
+        "type": "string",
+        "hint": "（仅在 API 地址为 custom 且 API 类型为 3 时生效）模板中必须包含 :server、:type、:id、:r 四个占位符，例如： server=:server&type=:type&id=:id&r=:r"
+      }
+    }
   },
   "default_source": {
     "description": "默认音源",
     "type": "string",
-    "hint": "可选：tencent（QQ音乐）、netease（网易云）、kugou（酷狗）、kuwo（酷我）",
+    "hint": "可选：tencent（QQ音乐）、netease（网易云）、kugou（酷狗）、kuwo（酷我），具体可用音源取决于所选 API 的支持情况",
     "default": "netease"
-  },
-  "api_type": {
-    "description": "API 类型",
-    "type": "int",
-    "hint": "1: Node API（默认）, 2: PHP API, 3: 自定义参数（在MetingAPI地址填写完整模板）",
-    "default": 1
   },
   "use_music_card": {
     "description": "使用音乐卡片",

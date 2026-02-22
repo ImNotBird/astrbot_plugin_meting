@@ -211,6 +211,7 @@ MIT License
 
 - [初叶🍂MetingAPI](https://github.com/chuyegzs/Meting-UI-API) - 初叶🍂二次开发的MetingAPI
 - [MetingAPI](https://github.com/metowolf/Meting) - 音乐 API 服务
+- [OIAPI-MusicCardSigned](https://oiapi.net/doc/id/78.html) - 音乐卡片签名API
 - [AstrBot](https://github.com/AstrBotDevs/AstrBot) - AstrBot机器人框架
 
 ## 支持
