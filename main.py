@@ -8,25 +8,27 @@ import aiohttp
 import aiofiles
 import hashlib
 from typing import Optional, List, Dict, Any
-from astrbot.api import logger, register, AstrBotEvent, CommandResult, PluginMetadata
+
+from astrbot.api import logger, AstrBotEvent, CommandResult, PluginMetadata
+from astrbot.api.star import register
 from astrbot.api.event import MessageChain
 from astrbot.api.platform import MessageType
 from astrbot.core.config.default import VERSION as ASTRBOT_VERSION
 
-# 插件元数据
 __plugin_meta__ = PluginMetadata(
-    name="MetingAPI 点歌",
-    version="1.2.0",
-    author="YourName",
-    description="基于 MetingAPI 的点歌插件，支持发送音乐卡片或 MP3 文件。",
-    help="直接发送歌曲名或链接即可点歌。配置 use_music_card 可切换卡片/文件模式。"
+    name="MetingAPI 点歌 (文件版)",
+    version="1.2.1",
+    author="Modified",
+    description="基于 MetingAPI 的点歌插件，支持发送 MP3 文件。",
+    help="直接发送歌曲名或链接即可点歌。"
 )
 
+# 注意：@register 装饰器的用法保持不变
 @register(
-    "meting_api",
+    "astrbot_plugin_meting", 
     "MetingAPI 点歌",
-    "1.2.0",
-    "https://github.com/yourname/meting-api-plugin"
+    "1.2.1",
+    "https://github.com/ImNotBird/astrbot_plugin_meting"
 )
 class MetingPlugin:
     def __init__(self, context):
