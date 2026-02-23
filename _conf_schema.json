@@ -18,69 +18,46 @@
       "api_type": {
         "description": "API 类型",
         "type": "int",
-        "hint": "（仅在 API 地址为 custom 时生效） 1: Node API （默认）, 2: PHP API, 3: 自定义参数",
+        "hint": "1: Node API, 2: PHP API, 3: 自定义参数",
         "default": 1
       },
       "custom_api_url": {
         "description": "自定义 API 地址",
-        "type": "string",
-        "hint": "（仅在 API 地址为 custom 时生效）不带 /api 的后缀，例如： https://api.example.com/meting"
-      },
-      "custom_api_template": {
-        "description": "自定义 API 模板",
-        "type": "string",
-        "hint": "（仅在 API 地址为 custom 且 API 类型为 3 时生效）模板中必须包含 :server、:type、:id、:r 四个占位符，例如： server=:server&type=:type&id=:id&r=:r"
+        "type": "string"
       }
     }
   },
   "default_source": {
     "description": "默认音源",
     "type": "string",
-    "hint": "可选：tencent（QQ音乐）、netease（网易云）、kugou（酷狗）、kuwo（酷我），具体可用音源取决于所选 API 的支持情况",
+    "hint": "tencent, netease, kugou, kuwo",
     "default": "netease"
   },
-  "use_music_card": {
-    "description": "使用音乐卡片",
-    "type": "bool",
-    "hint": "是否使用音乐卡片显示搜索结果，默认为 false",
-    "default": false
-  },
-  "api_sign_url": {
-    "description": "音乐卡片签名地址",
+  "selection_mode": {
+    "description": "搜索结果处理模式",
     "type": "string",
-    "hint": "用于获取 API 请求签名的地址",
-    "default": "https://oiapi.net/api/QQMusicJSONArk/"
+    "hint": "direct: 直接发送第一首; manual: 显示列表由用户手动选择",
+    "options": ["direct", "manual"],
+    "default": "manual"
+  },
+  "auto_parse_url": {
+    "description": "自动解析歌曲链接",
+    "type": "bool",
+    "hint": "识别到网易云/QQ音乐等链接时自动解析并发送音频文件",
+    "default": true
+  },
+  "max_file_size": {
+    "description": "最大文件大小 (MB)",
+    "type": "int",
+    "default": 50,
+    "minimum": 10,
+    "maximum": 200
   },
   "search_result_count": {
     "description": "搜索结果显示数量",
     "type": "int",
-    "hint": "搜索结果显示的歌曲数量，范围：5-30",
     "default": 10,
     "minimum": 5,
     "maximum": 30
-  },
-  "segment_duration": {
-    "description": "语音分段时长（秒）",
-    "type": "int",
-    "hint": "每条语音消息的最大时长，范围：30-300秒，默认120秒",
-    "default": 120,
-    "minimum": 30,
-    "maximum": 300
-  },
-  "send_interval": {
-    "description": "发送间隔（秒）",
-    "type": "float",
-    "hint": "发送语音片段之间的间隔时间，范围：0-10秒，默认1秒",
-    "default": 1.0,
-    "minimum": 0,
-    "maximum": 10
-  },
-  "max_file_size": {
-    "description": "最大文件大小（MB）",
-    "type": "int",
-    "hint": "下载歌曲的最大文件大小，范围：10-200MB，默认50MB",
-    "default": 50,
-    "minimum": 10,
-    "maximum": 200
   }
 }
