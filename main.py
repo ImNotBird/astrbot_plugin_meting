@@ -5,8 +5,8 @@ import tempfile
 import time
 import aiohttp
 from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.message_components import Json, File
+from astrbot.api.event import AstrMessageEvent, filter, on_event # 修正导入
+from astrbot.api.message_components import File
 from astrbot.api.star import Context, Star, register
 
 # 常量
@@ -21,7 +21,8 @@ class MetingPlugin(Star):
         self.config = config
         self._sessions = {}  # 结构: {session_id: {"results": [...], "timestamp": 123456}}
         self._http_session = None
-        self._cleanup_task = asyncio.create_task(self._session_cleanup_loop())  # 启动定时清理任务
+        # 启动定时清理任务
+        self._cleanup_task = asyncio.create_task(self._session_cleanup_loop())
 
     async def _get_session(self):
         if self._http_session is None or self._http_session.closed:
@@ -35,7 +36,7 @@ class MetingPlugin(Star):
                 await asyncio.sleep(60)
                 now = time.time()
                 expired_keys = [
-                    k for k, v in self._sessions.items()
+                    k for k, v in self._sessions.items() 
                     if now - v["timestamp"] > SESSION_EXPIRY
                 ]
                 for k in expired_keys:
@@ -62,162 +63,159 @@ class MetingPlugin(Star):
         session = await self._get_session()
         try:
             async with session.get(url, timeout=aiohttp.ClientTimeout(total=300)) as resp:
-                if resp.status != 200:
-                    return None
-
+                if resp.status != 200: return None
+                
                 size_limit = self._get_config("max_file_size", 50) * 1024 * 1024
                 if int(resp.headers.get('Content-Length', 0)) > size_limit:
                     return None
+
                 suffix = ".mp3"
                 ctype = resp.headers.get('Content-Type', '').lower()
-                if 'flac' in ctype:
-                    suffix = ".flac"
-                elif 'm4a' in ctype or 'mp4' in ctype:
-                    suffix = ".m4a"
+                if 'flac' in ctype: suffix = ".flac"
+                elif 'm4a' in ctype or 'mp4' in ctype: suffix = ".m4a"
+
+                # 使用 AstrBot 推荐的临时文件处理
                 fd, path = tempfile.mkstemp(suffix=suffix, prefix=TEMP_FILE_PREFIX)
                 with os.fdopen(fd, 'wb') as f:
                     while True:
                         chunk = await resp.content.read(CHUNK_SIZE)
-                        if not chunk:
-                            break
+                        if not chunk: break
                         f.write(chunk)
                 return path
         except Exception as e:
             logger.error(f"下载失败: {e}")
             return None
 
-    # --- API请求核心方法 ---
-    async def _fetch_api(self, type, query, server):
-        api_url = self._get_config("api_config", {}).get("api_url", "")
-        if api_url == "custom":
-            api_url = self._get_config("api_config", {}).get("custom_api_url", "")
-
-        api_type = self._get_config("api_config", {}).get("api_type", 1)
-        endpoint = f"{api_url.rstrip('/')}/api" if api_type == 1 else api_url
-
-        params = {"server": server, "type": type}
-        if type == "song":
-            params["id"] = query
-        else:
-            params["keywords"] = query
-
-        session = await self._get_session()
-        try:
-            async with session.get(endpoint, params=params) as resp:
-                if resp.status == 200:
-                    return await resp.json()
-        except Exception as e:
-            logger.error(f"API 请求失败: {e}")
-        return None
-
-    # --- 发送逻辑 ---
+    # --- 播放与发送逻辑 ---
     async def _play_song_logic(self, event: AstrMessageEvent, song: dict):
         song_url = song.get("url")
         if not song_url:
-            yield event.plain_result("无法获取歌曲地址")
+            yield event.plain_result("无法获取歌曲播放地址")
             return
+
+        is_valid, reason = await self._validate_url(song_url)
+        if not is_valid:
+            yield event.plain_result(f"校验失败: {reason}")
+            return
+
         try:
-            yield event.plain_result(f"正在准备音频: {song.get('title')}...")
+            yield event.plain_result(f"正在准备音频: {song.get('title')} - {song.get('author')}...")
             temp_file = await self._download_song(song_url)
+            
             if temp_file:
+                # 修复点：直接使用 File(path) 即可，不需要 fromFileSystem
                 yield event.chain_result([File(temp_file)])
-                await asyncio.sleep(15)
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
+                # 稍等片刻让框架读取文件，然后清理
+                await asyncio.sleep(20)
+                if os.path.exists(temp_file): os.remove(temp_file)
             else:
-                yield event.plain_result("文件下载失败")
+                yield event.plain_result("音频获取失败 (可能超过大小限制)")
         except Exception as e:
-            logger.error(f"播放逻辑出错: {e}")
+            logger.error(f"处理出错: {e}")
+
+    # --- 指令与事件监听 ---
 
     @filter.command("点歌")
     async def search_song(self, event: AstrMessageEvent, name: str):
         source = self._get_config("default_source", "netease")
+        yield event.plain_result(f"🔍 正在{source}搜索: {name}")
+        
         results = await self._fetch_api("search", name, source)
         if not results:
             yield event.plain_result("❌ 未找到相关歌曲")
             return
-        mode = self._get_config("selection_mode", "manual")
 
+        mode = self._get_config("selection_mode", "manual")
+        
         if mode == "direct":
             async for res in self._play_song_logic(event, results[0]):
                 yield res
         else:
-            # 存储搜索结果并记录当前时间戳
             session_id = event.unified_msg_origin
             self._sessions[session_id] = {
                 "results": results,
                 "timestamp": time.time()
             }
-
-            resp = f"🔍 搜索结果 (有效时间 {SESSION_EXPIRY}s)：\n"
+            
+            resp = f"💡 请在 {SESSION_EXPIRY}s 内输入序号点歌：\n"
             for i, s in enumerate(results[:self._get_config("search_result_count", 10)]):
                 resp += f"{i+1}. {s.get('title')} - {s.get('author')}\n"
             yield event.plain_result(resp.strip())
 
-    @filter.on_event(AstrMessageEvent)
-    async def handle_selection(self, event: AstrMessageEvent):
+    @on_event # 修复点：使用新版事件监听语法
+    async def handle_events(self, event: AstrMessageEvent):
+        """统一处理手动选择和链接解析"""
+        msg = event.get_message_str().strip()
         session_id = event.unified_msg_origin
-        if session_id not in self._sessions:
-            return
 
-        msg = event.get_message_str().strip()
-        if not msg.isdigit():
-            return
-
-        # 校验是否过期
-        session_data = self._sessions.get(session_id)
-        if time.time() - session_data["timestamp"] > SESSION_EXPIRY:
-            del self._sessions[session_id]
-            yield event.plain_result("⌛ 会话已过期，请重新搜歌")
-            return
-        idx = int(msg) - 1
-        results = session_data["results"]
-
-        if 0 <= idx < len(results):
-            self._sessions.pop(session_id)  # 选中后立即销毁
-            async for res in self._play_song_logic(event, results[idx]):
-                yield res
-
-    # --- 自动解析 URL ---
-    @filter.on_event(AstrMessageEvent)
-    async def handle_url_parse(self, event: AstrMessageEvent):
-        if not self._get_config("auto_parse_url", True):
-            return
-
-        msg = event.get_message_str().strip()
-        patterns = {
-            "netease": r"music\.163\.com/.*song\?id=(\d+)",
-            "tencent": r"y\.qq\.com/.*songDetail/([a-zA-Z0-9]+)",
-            "kugou": r"kugou\.com/.*hash=([a-zA-Z0-9]+)",
-            "kuwo": r"kuwo\.cn/play_detail/(\d+)"
-        }
-        for source, pattern in patterns.items():
-            match = re.search(pattern, msg)
-            if match:
-                song_id = match.group(1)
-                yield event.plain_result(f"🔗 链接解析中...")
-                song_info = await self._fetch_api("song", song_id, source)
-                if song_info:
-                    song_data = song_info[0] if isinstance(song_info, list) else song_info
-                    async for res in self._play_song_logic(event, song_data):
-                        yield res
+        # 1. 处理序号点歌逻辑
+        if session_id in self._sessions and msg.isdigit():
+            session_data = self._sessions.get(session_id)
+            if time.time() - session_data["timestamp"] > SESSION_EXPIRY:
+                del self._sessions[session_id]
+                yield event.plain_result("⌛ 会话已过期，请重新点歌")
                 return
 
-    def _cleanup_temp_files(self):
-        """强制清理临时文件"""
-        temp_dir = tempfile.gettempdir()
-        for f in os.listdir(temp_dir):
-            if f.startswith(TEMP_FILE_PREFIX):
-                try:
-                    os.remove(os.path.join(temp_dir, f))
-                except:
-                    pass
+            idx = int(msg) - 1
+            results = session_data["results"]
+            if 0 <= idx < len(results):
+                self._sessions.pop(session_id)
+                async for res in self._play_song_logic(event, results[idx]):
+                    yield res
+            return
+
+        # 2. 自动链接解析逻辑
+        if self._get_config("auto_parse_url", True):
+            patterns = {
+                "netease": r"music\.163\.com/.*song\?id=(\d+)",
+                "tencent": r"y\.qq\.com/.*songDetail/([a-zA-Z0-9]+)",
+                "kugou": r"kugou\.com/.*hash=([a-zA-Z0-9]+)",
+                "kuwo": r"kuwo\.cn/play_detail/(\d+)"
+            }
+            for source, pattern in patterns.items():
+                match = re.search(pattern, msg)
+                if match:
+                    song_id = match.group(1)
+                    yield event.plain_result(f"🔗 链接解析中...")
+                    song_info = await self._fetch_api("song", song_id, source)
+                    if song_info:
+                        song_data = song_info[0] if isinstance(song_info, list) else song_info
+                        async for res in self._play_song_logic(event, song_data):
+                            yield res
+                    return
+
+    async def _fetch_api(self, type, query, server):
+        """通用 API 请求封装"""
+        api_url = self._get_config("api_config", {}).get("api_url", "")
+        if api_url == "custom": api_url = self._get_config("api_config", {}).get("custom_api_url", "")
+        
+        api_type = self._get_config("api_config", {}).get("api_type", 1)
+        endpoint = f"{api_url.rstrip('/')}/api" if api_type == 1 else api_url
+        
+        params = {"server": server, "type": type}
+        if type == "song": params["id"] = query
+        else: params["keywords"] = query
+        
+        session = await self._get_session()
+        try:
+            async with session.get(endpoint, params=params) as resp:
+                if resp.status == 200: return await resp.json()
+        except Exception as e:
+            logger.error(f"API 请求失败: {e}")
+        return None
 
     async def terminate(self):
-        """插件终止时销毁任务和资源"""
+        """销毁插件"""
         if self._cleanup_task:
-            self._cleanup_task.cancel()  # 取消后台任务
+            self._cleanup_task.cancel()
         if self._http_session:
             await self._http_session.close()
         self._sessions.clear()
         self._cleanup_temp_files()
+
+    def _cleanup_temp_files(self):
+        temp_dir = tempfile.gettempdir()
+        for f in os.listdir(temp_dir):
+            if f.startswith(TEMP_FILE_PREFIX):
+                try: os.remove(os.path.join(temp_dir, f))
+                except: pass
